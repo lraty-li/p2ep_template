@@ -145,13 +145,9 @@ def generate_font_page(page_num, page_data, font, output_path, font_info_list=No
             if char != "":
                 img.paste(char_img, (x_pos, y_pos), char_img)
             
-            # 分析字符并添加到 font_info（处理所有字符）
-            if font_info_list is not None:
-                if char == "":
-                    # 空字符使用默认值
-                    left, width = 0, 4
-                else:
-                    left, width = analyze_char(char_img)
+            # 分析字符并添加到 font_info（只处理非空字符）
+            if font_info_list is not None and char != "":
+                left, width = analyze_char(char_img)
                 
                 font_info_list.append({
                     "char": char,
@@ -222,6 +218,74 @@ def main():
         with open(font_info_path, 'w', encoding='utf-8') as f:
             json.dump(font_info_list, f, ensure_ascii=False, indent=4)
         print(f"完成! 已生成 {len(font_info_list)} 个字符的字体信息")
+    
+    # 更新 files.json
+    update_files_json(script_dir, start_page, end_page)
+
+def update_files_json(script_dir, start_page, end_page):
+    """更新 files.json，确保所有生成的 font*.png 都在其中"""
+    files_json_path = os.path.join(script_dir, 'files.json')
+    
+    if not os.path.exists(files_json_path):
+        print(f"\n警告: 未找到 files.json: {files_json_path}")
+        return
+    
+    # 读取现有的 files.json
+    print(f"\n读取 files.json: {files_json_path}")
+    with open(files_json_path, 'r', encoding='utf-8') as f:
+        files_data = json.load(f)
+    
+    # 检查实际生成的 font*.png 文件
+    generated_fonts = []
+    for page_num in range(start_page, end_page + 1):
+        font_filename = f'font{page_num}.png'
+        font_path = os.path.join(script_dir, font_filename)
+        if os.path.exists(font_path):
+            generated_fonts.append(font_filename)
+    
+    # 更新 files.json 的 files 部分
+    if 'files' not in files_data:
+        files_data['files'] = {}
+    
+    # 计算对应的 gim 路径（从 font0.png 对应 5.gim$ 开始）
+    base_gim_index = 5
+    
+    updated_count = 0
+    for font_filename in generated_fonts:
+        # 从 font0.png 提取页码
+        try:
+            page_num = int(font_filename.replace('font', '').replace('.png', ''))
+            gim_index = base_gim_index + page_num
+            gim_path = f"{gim_index}.gim$/image.png"
+            
+            # 更新或添加条目
+            if font_filename not in files_data['files']:
+                files_data['files'][font_filename] = []
+            
+            # 检查是否已有对应的 gim 路径
+            found = False
+            for entry in files_data['files'][font_filename]:
+                if entry.get('path') == gim_path:
+                    found = True
+                    break
+            
+            if not found:
+                # 如果没有找到，更新为正确的路径（替换所有旧条目）
+                files_data['files'][font_filename] = [{
+                    "path": gim_path,
+                    "args": { "useSourcePalette": True, "matchPalette": True }
+                }]
+                updated_count += 1
+        except ValueError:
+            # 如果不是标准格式的 font*.png，跳过
+            continue
+    
+    # 保存更新后的 files.json
+    if updated_count > 0 or len(generated_fonts) > 0:
+        print(f"\n更新 files.json...")
+        with open(files_json_path, 'w', encoding='utf-8') as f:
+            json.dump(files_data, f, ensure_ascii=False, indent=2)
+        print(f"完成! 已更新 {len(generated_fonts)} 个字体图片条目到 files.json")
 
 if __name__ == '__main__':
     main()

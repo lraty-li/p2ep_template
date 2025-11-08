@@ -79,21 +79,14 @@ def parse_msg_file(file_path: Path) -> Dict[str, Any]:
             while i < len(lines):
                 current_line = lines[i]
                 
-                # 检查是否到达结束标记
-                if '[end]' in current_line:
-                    # 提取结束标记前的所有内容
-                    end_content = current_line.strip()
-                    msg_lines.append({
-                        "type": "end",
-                        "format": end_content
-                    })
-                    i += 1
-                    break
-                
-                # 解析当前行
+                # 解析当前行（[end] 作为普通控制标记处理）
                 parsed_line = parse_message_line(current_line)
                 if parsed_line:
                     msg_lines.append(parsed_line)
+                    # 如果 format 中包含 [end]，结束消息块收集
+                    if '[end]' in parsed_line.get("format", ""):
+                        i += 1
+                        break
                 
                 i += 1
             
@@ -119,6 +112,72 @@ def parse_msg_file(file_path: Path) -> Dict[str, Any]:
     return result
 
 
+def extract_all_control_markers(line: str) -> tuple[str, list[str], list[str]]:
+    """
+    从行中提取所有控制标记（[...]格式）和文本内容
+    
+    返回: (文本内容, [文本前的标记列表], [文本后的标记列表])
+    """
+    # 从前往后解析，保持标记的原始顺序和位置
+    markers_before = []
+    markers_after = []
+    text_parts = []
+    
+    i = 0
+    text_started = False  # 是否已经开始遇到非空白文本内容
+    
+    while i < len(line):
+        if line[i] == '[':
+            # 找到左括号，查找匹配的右括号
+            depth = 1
+            j = i + 1
+            paren_depth = 0  # 圆括号深度
+            
+            while j < len(line) and depth > 0:
+                if line[j] == '[':
+                    if paren_depth == 0:
+                        depth += 1
+                elif line[j] == ']':
+                    if paren_depth == 0:
+                        depth -= 1
+                    else:
+                        # 这是圆括号内的右括号，不是标记的结束
+                        pass
+                elif line[j] == '(':
+                    paren_depth += 1
+                elif line[j] == ')':
+                    paren_depth -= 1
+                j += 1
+            
+            if depth == 0:
+                # 找到了完整的标记
+                marker = line[i:j]
+                if text_started:
+                    markers_after.append(marker)
+                else:
+                    markers_before.append(marker)
+                i = j
+            else:
+                # 未找到匹配的右括号，当作普通字符处理
+                if line[i].strip():
+                    text_started = True
+                text_parts.append(line[i])
+                i += 1
+        else:
+            # 普通字符
+            char = line[i]
+            # 如果遇到非空白字符，标记文本已开始
+            if char.strip():
+                text_started = True
+            text_parts.append(char)
+            i += 1
+    
+    # 清理文本（去除多余空格）
+    text = ''.join(text_parts).strip()
+    
+    return text, markers_before, markers_after
+
+
 def parse_message_line(line: str) -> Optional[Dict[str, Any]]:
     """
     解析单行消息内容
@@ -133,46 +192,38 @@ def parse_message_line(line: str) -> Optional[Dict[str, Any]]:
     if not line.strip():
         return None
     
+    # 提取所有控制标记和文本（区分文本前后的标记）
+    text_content, markers_before, markers_after = extract_all_control_markers(line)
+    
     # 检查是否是角色名行: [color(yellow)]文本[color(white)]
-    speaker_pattern = r'\[color\(yellow\)\](.*?)\[color\(white\)\]'
-    match = re.search(speaker_pattern, line)
-    if match:
-        text = match.group(1)
+    all_markers = markers_before + markers_after
+    if len(all_markers) >= 2 and all_markers[0] == '[color(yellow)]' and all_markers[-1] == '[color(white)]':
         return {
             "type": "speaker",
-            "text": text,
+            "text": text_content,
             "format": "[color(yellow)]{text}[color(white)]"
         }
     
-    # 检查是否是对话行: [tab]文本
-    if line.startswith('[tab]'):
-        text = line[5:]  # 移除 [tab]
-        return {
-            "type": "dialogue",
-            "text": text,
-            "format": "[tab]{text}"
-        }
-    
-    # 其他格式的行（可能包含其他标记）
-    # 尝试提取文本内容
-    text = line
+    # 处理对话行
     format_parts = []
     
-    # 处理 [tab] 前缀
-    if text.startswith('[tab]'):
-        format_parts.append('[tab]')
-        text = text[5:]
+    # 添加文本前的标记
+    format_parts.extend(markers_before)
     
-    # 处理其他标记（如果有）
-    if text.strip():
+    # 添加文本占位符
+    if text_content:
         format_parts.append('{text}')
-        return {
-            "type": "dialogue",
-            "text": text,
-            "format": ''.join(format_parts)
-        }
     
-    return None
+    # 添加文本后的标记
+    format_parts.extend(markers_after)
+    
+    format_str = ''.join(format_parts)
+    
+    return {
+        "type": "dialogue",
+        "text": text_content,
+        "format": format_str
+    }
 
 
 def extract_texts_for_translation(json_data: Dict[str, Any]) -> Dict[str, List[Dict[str, str]]]:
@@ -268,10 +319,6 @@ def rebuild_msg_file(json_data: Dict[str, Any], translated_texts: Dict[str, List
                 format_str = line["format"].replace("{text}", text)
                 lines.append(format_str)
                 dialogue_index += 1
-            
-            elif line["type"] == "end":
-                # 结束标记
-                lines.append(line["format"])
         
         # 添加消息后的注释和空行
         if comment_index < len(json_data["comments"]):

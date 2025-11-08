@@ -4,9 +4,9 @@
         {
             "label": "Build",
             "type": "shell",
-            "command": "${workspaceFolder}\\build.bat",
+            "command": "${workspaceFolder}\\build_all.bat",
             "windows": {
-                "command": "${workspaceFolder}\\build.bat"
+                "command": "${workspaceFolder}\\build_all.bat"
             },
             "problemMatcher": [],
             "presentation": {

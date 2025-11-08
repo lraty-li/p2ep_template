@@ -1,3 +1,8 @@
 .work
 build
 *.iso
+font/font*.png
+extraction
+**.pyc
+api_key.txt
+bug/*
