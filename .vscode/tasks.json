@@ -20,6 +20,23 @@
                 "kind": "build",
                 "isDefault": true
             }
+        },
+        {
+            "label": "清除翻译进度",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-Command",
+                "Remove-Item -Path '${workspaceFolder}\\texts\\translate_progress.json', '${workspaceFolder}\\texts\\speakers_translated.json', '${workspaceFolder}\\texts\\texts_translated.json' -ErrorAction SilentlyContinue; Write-Host '已清除翻译进度文件'"
+            ],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": false,
+                "echo": true,
+                "clear": false
+            }
         }
     ]
 }

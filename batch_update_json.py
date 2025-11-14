@@ -63,9 +63,24 @@ def update_json_with_translations(
         if msg_name in dialogue_map:
             for line in msg_data["lines"]:
                 if line["type"] == "dialogue":
-                    dialogue_id = f"{msg_name}_dialogue_{dialogue_index}"
-                    if dialogue_id in dialogue_map[msg_name]:
-                        line["text"] = dialogue_map[msg_name][dialogue_id]
+                    # 检查原始 text 是否是数组（多个文本段）
+                    original_text = line.get("text")
+                    is_multiple_segments = isinstance(original_text, list)
+                    
+                    if is_multiple_segments:
+                        # 多个文本段：查找各个文本段的翻译
+                        translated_segments = []
+                        for seg_idx in range(len(original_text)):
+                            seg_id = f"{msg_name}_dialogue_{dialogue_index}_seg_{seg_idx}"
+                            translated = dialogue_map[msg_name].get(seg_id)
+                            translated_segments.append(translated if translated else original_text[seg_idx])
+                        line["text"] = translated_segments
+                    else:
+                        # 单个文本段：查找翻译
+                        dialogue_id = f"{msg_name}_dialogue_{dialogue_index}"
+                        if dialogue_id in dialogue_map[msg_name]:
+                            line["text"] = dialogue_map[msg_name][dialogue_id]
+                    
                     dialogue_index += 1
     
     return json_data

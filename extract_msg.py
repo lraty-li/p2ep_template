@@ -11,138 +11,25 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 
-def parse_msg_file(file_path: Path) -> Dict[str, Any]:
-    """
-    解析 .msg 文件为结构化 JSON
-    
-    返回格式:
-    {
-        "comments": [""],  # 文件开头的注释
-        "messages": {
-            "msg_0": {
-                "lines": [
-                    {
-                        "type": "speaker",  # "speaker" | "dialogue" | "end"
-                        "text": "お婆さん",
-                        "format": "[color(yellow)]{text}[color(white)]"
-                    },
-                    {
-                        "type": "dialogue",
-                        "text": "なんとまぁ、寂しい背中だい…",
-                        "format": "[tab]{text}"
-                    },
-                    {
-                        "type": "end",
-                        "format": "[sync][wait][clear][end]"
-                    }
-                ]
-            }
-        },
-        "order": ["msg_0", "msg_1", ...]
-    }
-    """
-    with open(file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-    
-    lines = content.split('\n')
-    result = {
-        "comments": [],
-        "messages": {},
-        "order": []
-    }
-    
-    current_comment = []
-    i = 0
-    
-    # 处理文件开头的注释
-    while i < len(lines):
-        line = lines[i]
-        if line.strip().endswith(':') and not line.strip().startswith('#'):
-            break
-        current_comment.append(line)
-        i += 1
-    
-    result["comments"].append('\n'.join(current_comment))
-    
-    # 解析消息块
-    while i < len(lines):
-        line = lines[i].strip()
-        
-        # 检查是否是消息标识
-        if line.endswith(':') and not line.startswith('#'):
-            msg_name = line[:-1].strip()
-            i += 1
-            
-            msg_lines = []
-            
-            # 收集消息内容直到 [end]
-            while i < len(lines):
-                current_line = lines[i]
-                
-                # 解析当前行（[end] 作为普通控制标记处理）
-                parsed_line = parse_message_line(current_line)
-                if parsed_line:
-                    msg_lines.append(parsed_line)
-                    # 如果 format 中包含 [end]，结束消息块收集
-                    if '[end]' in parsed_line.get("format", ""):
-                        i += 1
-                        break
-                
-                i += 1
-            
-            result["messages"][msg_name] = {
-                "lines": msg_lines
-            }
-            result["order"].append(msg_name)
-            
-            # 收集消息后的注释
-            current_comment = []
-            while i < len(lines):
-                line = lines[i]
-                if line.strip().endswith(':') and not line.strip().startswith('#'):
-                    break
-                current_comment.append(line)
-                i += 1
-            
-            if current_comment:
-                result["comments"].append('\n'.join(current_comment))
-        else:
-            i += 1
-    
-    return result
-
-
-def extract_all_control_markers(line: str) -> tuple[str, list[str], list[str]]:
-    """
-    从行中提取所有控制标记（[...]格式）和文本内容
-    
-    返回: (文本内容, [文本前的标记列表], [文本后的标记列表])
-    """
-    # 从前往后解析，保持标记的原始顺序和位置
+def extract_markers(line: str) -> tuple[str, list[str], list[str]]:
+    """提取控制标记和文本内容，返回 (文本, 文本前标记, 文本后标记)"""
     markers_before = []
     markers_after = []
     text_parts = []
-    
+    text_started = False
     i = 0
-    text_started = False  # 是否已经开始遇到非空白文本内容
     
     while i < len(line):
         if line[i] == '[':
-            # 找到左括号，查找匹配的右括号
             depth = 1
+            paren_depth = 0
             j = i + 1
-            paren_depth = 0  # 圆括号深度
             
             while j < len(line) and depth > 0:
-                if line[j] == '[':
-                    if paren_depth == 0:
-                        depth += 1
-                elif line[j] == ']':
-                    if paren_depth == 0:
-                        depth -= 1
-                    else:
-                        # 这是圆括号内的右括号，不是标记的结束
-                        pass
+                if line[j] == '[' and paren_depth == 0:
+                    depth += 1
+                elif line[j] == ']' and paren_depth == 0:
+                    depth -= 1
                 elif line[j] == '(':
                     paren_depth += 1
                 elif line[j] == ')':
@@ -150,115 +37,259 @@ def extract_all_control_markers(line: str) -> tuple[str, list[str], list[str]]:
                 j += 1
             
             if depth == 0:
-                # 找到了完整的标记
                 marker = line[i:j]
-                if text_started:
-                    markers_after.append(marker)
-                else:
-                    markers_before.append(marker)
+                (markers_after if text_started else markers_before).append(marker)
                 i = j
             else:
-                # 未找到匹配的右括号，当作普通字符处理
                 if line[i].strip():
                     text_started = True
                 text_parts.append(line[i])
                 i += 1
         else:
-            # 普通字符
-            char = line[i]
-            # 如果遇到非空白字符，标记文本已开始
-            if char.strip():
+            if line[i].strip():
                 text_started = True
-            text_parts.append(char)
+            text_parts.append(line[i])
             i += 1
     
-    # 清理文本（去除多余空格）
-    text = ''.join(text_parts).strip()
-    
-    return text, markers_before, markers_after
+    return ''.join(text_parts).strip(), markers_before, markers_after
 
 
-def parse_message_line(line: str) -> Optional[Dict[str, Any]]:
-    """
-    解析单行消息内容
+def is_first_line_speaker(line: str) -> Optional[Dict[str, Any]]:
+    """判断消息块第一行是否为 speaker：有 [color(...)] 且无 [tab]"""
+    if '[tab]' in line:
+        return None
     
-    返回格式:
-    - {"type": "speaker", "text": "...", "format": "..."}
-    - {"type": "dialogue", "text": "...", "format": "..."}
-    - None (空行)
-    """
+    text, markers_before, markers_after = extract_markers(line)
+    all_markers = markers_before + markers_after
+    
+    color_pattern = re.compile(r'^\[color\([^)]+\)\]$')
+    color_markers = [m for m in all_markers if color_pattern.match(m)]
+    
+    if len(color_markers) >= 2:
+        format_str = color_markers[0] + '{text}' + color_markers[-1]
+        return {
+            "type": "speaker",
+            "text": text,
+            "format": format_str
+        }
+    
+    return None
+
+
+def parse_line(line: str) -> Optional[Dict[str, Any]]:
+    """解析单行消息，遇到控制符进行分块，提取所有文本段"""
     line = line.rstrip()
-    
     if not line.strip():
         return None
     
-    # 提取所有控制标记和文本（区分文本前后的标记）
-    text_content, markers_before, markers_after = extract_all_control_markers(line)
+    # 提取所有文本段和控制符
+    text_segments = []
+    format_parts = []
+    i = 0
+    current_text = ""
     
-    # 检查是否是角色名行: [color(yellow)]文本[color(white)]
-    all_markers = markers_before + markers_after
-    if len(all_markers) >= 2 and all_markers[0] == '[color(yellow)]' and all_markers[-1] == '[color(white)]':
+    while i < len(line):
+        if line[i] == '[':
+            # 遇到控制符，先保存当前文本段
+            if current_text.strip():
+                text_segments.append(current_text.strip())
+                format_parts.append(f"{{text{len(text_segments)-1}}}")
+            current_text = ""
+            
+            # 解析控制符
+            depth = 1
+            paren_depth = 0
+            j = i + 1
+            while j < len(line) and depth > 0:
+                if line[j] == '[' and paren_depth == 0:
+                    depth += 1
+                elif line[j] == ']' and paren_depth == 0:
+                    depth -= 1
+                elif line[j] == '(':
+                    paren_depth += 1
+                elif line[j] == ')':
+                    paren_depth -= 1
+                j += 1
+            
+            if depth == 0:
+                marker = line[i:j]
+                format_parts.append(marker)
+                i = j
+            else:
+                current_text += line[i]
+                i += 1
+        else:
+            current_text += line[i]
+            i += 1
+    
+    # 处理最后的文本段
+    if current_text.strip():
+        text_segments.append(current_text.strip())
+        format_parts.append(f"{{text{len(text_segments)-1}}}")
+    
+    # 如果没有文本段，只有控制符
+    if not text_segments:
         return {
-            "type": "speaker",
-            "text": text_content,
-            "format": "[color(yellow)]{text}[color(white)]"
+            "type": "dialogue",
+            "text": "",
+            "format": ''.join(format_parts)
         }
     
-    # 处理对话行
-    format_parts = []
+    # 如果有多个文本段，使用数组存储；如果只有一个，保持兼容性
+    if len(text_segments) == 1:
+        format_str = ''.join(format_parts).replace("{text0}", "{text}")
+        return {
+            "type": "dialogue",
+            "text": text_segments[0],
+            "format": format_str
+        }
+    else:
+        return {
+            "type": "dialogue",
+            "text": text_segments,  # 数组
+            "format": ''.join(format_parts)  # 包含 {text0}, {text1} 等
+        }
+
+
+def merge_tab_dialogues(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """合并连续的 [tab] dialogue 行，保留所有控制符和所有文本段"""
+    result = []
+    i = 0
     
-    # 添加文本前的标记
-    format_parts.extend(markers_before)
+    while i < len(lines):
+        line = lines[i]
+        if line.get("type") == "dialogue" and "[tab]" in line.get("format", ""):
+            # 收集连续的 [tab] dialogue
+            format_parts = []
+            all_text_segments = []
+            
+            while i < len(lines) and lines[i].get("type") == "dialogue" and "[tab]" in lines[i].get("format", ""):
+                format_str = lines[i].get("format", "")
+                text = lines[i].get("text", "")
+                
+                # 获取所有文本段并展开格式字符串
+                if isinstance(text, list):
+                    all_text_segments.extend(text)
+                    # 展开格式：替换 {text0}, {text1} 等为实际文本
+                    expanded = format_str
+                    for idx, seg in enumerate(text):
+                        expanded = expanded.replace(f"{{text{idx}}}", seg, 1)
+                else:
+                    if text:
+                        all_text_segments.append(text)
+                    expanded = format_str.replace("{text}", text)
+                
+                format_parts.append(expanded)
+                i += 1
+            
+            # 合并所有格式字符串（已展开的完整格式）
+            merged_format_expanded = "".join(format_parts)
+            
+            # 将合并后的格式字符串中的文本段替换为占位符（从后往前替换）
+            merged_format = merged_format_expanded
+            for text_idx in range(len(all_text_segments) - 1, -1, -1):
+                seg = all_text_segments[text_idx]
+                pos = merged_format.rfind(seg)
+                if pos != -1:
+                    placeholder = "{text}" if (text_idx == 0 and len(all_text_segments) == 1) else f"{{text{text_idx}}}"
+                    merged_format = merged_format[:pos] + placeholder + merged_format[pos + len(seg):]
+            
+            # 构建结果
+            result.append({
+                "type": "dialogue",
+                "text": all_text_segments[0] if len(all_text_segments) == 1 else all_text_segments,
+                "format": merged_format
+            })
+        else:
+            result.append(line)
+            i += 1
     
-    # 添加文本占位符
-    if text_content:
-        format_parts.append('{text}')
+    return result
+
+
+def parse_msg_file(file_path: Path) -> Dict[str, Any]:
+    """解析 .msg 文件为 JSON"""
+    with open(file_path, 'r', encoding='utf-8') as f:
+        lines = f.read().split('\n')
     
-    # 添加文本后的标记
-    format_parts.extend(markers_after)
+    result = {"comments": [], "messages": {}, "order": []}
+    i = 0
     
-    format_str = ''.join(format_parts)
+    # 文件开头注释
+    while i < len(lines) and not (lines[i].strip().endswith(':') and not lines[i].strip().startswith('#')):
+        i += 1
+    result["comments"].append('\n'.join(lines[:i]))
     
-    return {
-        "type": "dialogue",
-        "text": text_content,
-        "format": format_str
-    }
+    # 解析消息块
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.endswith(':') and not line.startswith('#'):
+            msg_name = line[:-1].strip()
+            i += 1
+            
+            # 收集消息行
+            msg_lines = []
+            is_first_line = True
+            while i < len(lines):
+                if is_first_line:
+                    speaker_parsed = is_first_line_speaker(lines[i])
+                    if speaker_parsed:
+                        msg_lines.append(speaker_parsed)
+                        is_first_line = False
+                        if '[end]' in speaker_parsed.get("format", ""):
+                            i += 1
+                            break
+                        i += 1
+                        continue
+                    is_first_line = False
+                
+                parsed = parse_line(lines[i])
+                if parsed:
+                    msg_lines.append(parsed)
+                    if '[end]' in parsed.get("format", ""):
+                        i += 1
+                        break
+                i += 1
+            
+            # 合并 [tab] dialogue
+            result["messages"][msg_name] = {"lines": merge_tab_dialogues(msg_lines)}
+            result["order"].append(msg_name)
+            
+            # 消息后注释
+            comment_start = i
+            while i < len(lines) and not (lines[i].strip().endswith(':') and not lines[i].strip().startswith('#')):
+                i += 1
+            result["comments"].append('\n'.join(lines[comment_start:i]))
+        else:
+            i += 1
+    
+    return result
 
 
 def extract_texts_for_translation(json_data: Dict[str, Any]) -> Dict[str, List[Dict[str, str]]]:
-    """
-    从 JSON 数据中提取纯文本，用于翻译
-    
-    返回格式:
-    {
-        "msg_0": [
-            {"id": "msg_0_speaker", "text": "お婆さん"},
-            {"id": "msg_0_dialogue_0", "text": "なんとまぁ、寂しい背中だい…"},
-            ...
-        ],
-        ...
-    }
-    """
+    """提取文本用于翻译"""
     texts = {}
     
     for msg_name in json_data["order"]:
-        msg_data = json_data["messages"][msg_name]
         msg_texts = []
+        dialogue_idx = 0
         
-        dialogue_index = 0
-        for line in msg_data["lines"]:
+        for line in json_data["messages"][msg_name]["lines"]:
             if line["type"] == "speaker":
-                msg_texts.append({
-                    "id": f"{msg_name}_speaker",
-                    "text": line["text"]
-                })
+                msg_texts.append({"id": f"{msg_name}_speaker", "text": line["text"]})
             elif line["type"] == "dialogue":
-                msg_texts.append({
-                    "id": f"{msg_name}_dialogue_{dialogue_index}",
-                    "text": line["text"]
-                })
-                dialogue_index += 1
+                text = line.get("text")
+                # 处理多个文本段（数组）或单个文本段（字符串）
+                if isinstance(text, list):
+                    # 多个文本段
+                    for seg_idx, seg in enumerate(text):
+                        if seg:
+                            msg_texts.append({"id": f"{msg_name}_dialogue_{dialogue_idx}_seg_{seg_idx}", "text": seg})
+                    dialogue_idx += 1
+                elif text:
+                    # 单个文本段
+                    msg_texts.append({"id": f"{msg_name}_dialogue_{dialogue_idx}", "text": text})
+                    dialogue_idx += 1
         
         if msg_texts:
             texts[msg_name] = msg_texts
@@ -266,72 +297,81 @@ def extract_texts_for_translation(json_data: Dict[str, Any]) -> Dict[str, List[D
     return texts
 
 
+def find_translated_text(translated_texts: Optional[Dict], msg_name: str, item_id: str) -> Optional[str]:
+    """查找翻译文本"""
+    if not translated_texts or msg_name not in translated_texts:
+        return None
+    for item in translated_texts[msg_name]:
+        if item["id"] == item_id:
+            return item["text"]
+    return None
+
+
 def rebuild_msg_file(json_data: Dict[str, Any], translated_texts: Dict[str, List[Dict[str, str]]] = None) -> str:
-    """
-    从 JSON 数据重组 .msg 文件
-    
-    Args:
-        json_data: 原始 JSON 数据
-        translated_texts: 翻译后的文本（可选，如果不提供则使用原始文本）
-    
-    返回重组后的 .msg 文件内容
-    """
+    """重组 .msg 文件"""
     lines = []
     
-    # 添加文件开头的注释
     if json_data["comments"]:
         lines.append(json_data["comments"][0])
     
-    # 处理每个消息块
-    comment_index = 1
+    comment_idx = 1
     for msg_name in json_data["order"]:
-        msg_data = json_data["messages"][msg_name]
-        
-        # 消息标识
         lines.append(f"{msg_name}:")
         
-        # 处理消息行
-        dialogue_index = 0
-        for line in msg_data["lines"]:
+        dialogue_idx = 0
+        for line in json_data["messages"][msg_name]["lines"]:
             if line["type"] == "speaker":
-                # 使用翻译后的文本或原始文本
-                text = line["text"]
-                if translated_texts and msg_name in translated_texts:
-                    for item in translated_texts[msg_name]:
-                        if item["id"] == f"{msg_name}_speaker":
-                            text = item["text"]
-                            break
-                
-                # 重组格式
-                format_str = line["format"].replace("{text}", text)
-                lines.append(format_str)
-            
+                text = find_translated_text(translated_texts, msg_name, f"{msg_name}_speaker") or line["text"]
+                lines.append(line["format"].replace("{text}", text))
             elif line["type"] == "dialogue":
-                # 使用翻译后的文本或原始文本
-                text = line["text"]
-                if translated_texts and msg_name in translated_texts:
-                    for item in translated_texts[msg_name]:
-                        if item["id"] == f"{msg_name}_dialogue_{dialogue_index}":
-                            text = item["text"]
-                            break
+                format_str = line["format"]
+                text = line.get("text", "")
                 
-                # 重组格式
-                format_str = line["format"].replace("{text}", text)
+                # 处理多个文本段（数组）或单个文本段（字符串）
+                if isinstance(text, list):
+                    # 多个文本段：替换 {text0}, {text1} 等
+                    for seg_idx, seg in enumerate(text):
+                        translated = find_translated_text(translated_texts, msg_name, f"{msg_name}_dialogue_{dialogue_idx}_seg_{seg_idx}") or seg
+                        format_str = format_str.replace(f"{{text{seg_idx}}}", translated, 1)
+                else:
+                    # 单个文本段：检查是否有多个占位符（数据不一致的情况）
+                    if re.search(r'\{text\d+\}', format_str):
+                        # format 中有多个占位符，尝试从翻译文本中查找各个文本段
+                        seg_idx = 0
+                        while True:
+                            placeholder = f"{{text{seg_idx}}}"
+                            if placeholder not in format_str:
+                                break
+                            seg_translated = find_translated_text(translated_texts, msg_name, f"{msg_name}_dialogue_{dialogue_idx}_seg_{seg_idx}")
+                            if seg_translated:
+                                format_str = format_str.replace(placeholder, seg_translated, 1)
+                            elif seg_idx == 0:
+                                # 第一个占位符使用整个文本
+                                translated = find_translated_text(translated_texts, msg_name, f"{msg_name}_dialogue_{dialogue_idx}") or text
+                                format_str = format_str.replace(placeholder, translated or "", 1)
+                            else:
+                                # 其他占位符用空字符串替换
+                                format_str = format_str.replace(placeholder, "", 1)
+                            seg_idx += 1
+                    else:
+                        # 单个占位符 {text}
+                        translated = find_translated_text(translated_texts, msg_name, f"{msg_name}_dialogue_{dialogue_idx}") or text
+                        format_str = format_str.replace("{text}", translated or "")
+                
+                # 清理任何剩余的未替换占位符
+                format_str = re.sub(r'\{text\d+\}', '', format_str)
+                
                 lines.append(format_str)
-                dialogue_index += 1
+                dialogue_idx += 1
+            elif line.get("format"):
+                lines.append(line["format"])
         
-        # 添加消息后的注释和空行
-        if comment_index < len(json_data["comments"]):
-            comment = json_data["comments"][comment_index]
-            if comment.strip():
-                lines.append(comment)
-            else:
-                # 如果没有注释，添加空行以保持格式
-                lines.append("")
-            comment_index += 1
+        # 添加注释或空行
+        if comment_idx < len(json_data["comments"]):
+            lines.append(json_data["comments"][comment_idx] or "")
         else:
-            # 如果注释用完了，添加空行
             lines.append("")
+        comment_idx += 1
     
     return '\n'.join(lines)
 
@@ -355,11 +395,8 @@ if __name__ == "__main__":
         output_file = Path(sys.argv[3])
         
         print(f"正在提取: {input_file} -> {output_file}")
-        json_data = parse_msg_file(input_file)
-        
         with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(json_data, f, ensure_ascii=False, indent=2)
-        
+            json.dump(parse_msg_file(input_file), f, ensure_ascii=False, indent=2)
         print(f"提取完成: {output_file}")
     
     elif command == "rebuild":
@@ -372,7 +409,6 @@ if __name__ == "__main__":
         translated_file = Path(sys.argv[4]) if len(sys.argv) > 4 else None
         
         print(f"正在重组: {input_file} -> {output_file}")
-        
         with open(input_file, 'r', encoding='utf-8') as f:
             json_data = json.load(f)
         
@@ -381,11 +417,8 @@ if __name__ == "__main__":
             with open(translated_file, 'r', encoding='utf-8') as f:
                 translated_texts = json.load(f)
         
-        msg_content = rebuild_msg_file(json_data, translated_texts)
-        
         with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(msg_content)
-        
+            f.write(rebuild_msg_file(json_data, translated_texts))
         print(f"重组完成: {output_file}")
     
     else:

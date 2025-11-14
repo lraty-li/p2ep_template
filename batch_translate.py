@@ -22,9 +22,13 @@ DEFAULT_PROGRESS_FILE = Path("texts/translate_progress.json")
 
 # API 配置
 API_BASE_URL = "https://api.vveai.com/v1/chat/completions"
-MODEL = "gpt-4o-mini"  # 或 "gpt-3.5-turbo", "gpt-4" 等
+MODEL = "gpt-4.1-mini"  # 或 "gpt-3.5-turbo", "gpt-4" 等
 MAX_RETRIES = 3
 RETRY_DELAY = 1  # 秒
+CONTEXT_MAX_CHARS = 4096  # 上下文最大字符数（包括整个 prompt）
+CONTEXT_MAX_ITEMS = 5  # 前后文最多收集的条数（每条）
+MAX_WORKERS = 10  # 最大并发线程数
+MAX_TASKS = None  # 最大任务数限制（None 表示不限制，可以设置为数字如 100）
 
 
 def load_api_key(api_key_file: Path) -> Optional[str]:
@@ -62,11 +66,11 @@ def save_progress(progress_file: Path, progress_data: Dict[str, Any]):
 def init_progress(texts_file: Path, output_file: Path) -> Dict[str, Any]:
     """初始化进度记录结构"""
     return {
-        "version": "1.1",
+        "version": "1.2",  # 更新版本号，使用 id 而不是 idx
         "source_file": str(texts_file),
         "output_file": str(output_file),
-        "completed": {},  # {"file_key": [idx1, idx2, ...]} - 只存储索引，不存储翻译文本
-        "failed": {},     # {"file_key": [idx1, idx2, ...]} - 只存储索引，不存储任何其他信息
+        "completed": {},  # {"file_key": [id1, id2, ...]} - 存储 id，不存储翻译文本
+        "failed": {},     # {"file_key": [id1, id2, ...]} - 存储 id，不存储任何其他信息
         "stats": {
             "total": 0,
             "completed": 0,
@@ -75,55 +79,374 @@ def init_progress(texts_file: Path, output_file: Path) -> Dict[str, Any]:
     }
 
 
-def get_task_key(file_key: str, idx: int) -> str:
-    """生成任务唯一标识"""
-    return f"{file_key}:{idx}"
+def load_terms(terms_file: Path) -> Dict[str, str]:
+    """从文件加载术语表"""
+    if terms_file.exists():
+        try:
+            with open(terms_file, 'r', encoding='utf-8') as f:
+                terms = json.load(f)
+                # 过滤掉空值
+                return {k: v for k, v in terms.items() if v and v.strip()}
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"警告: 无法读取术语表文件 {terms_file}: {e}")
+            return {}
+    return {}
 
 
-def load_translated_from_output(output_file: Path, original_texts_dict: Dict[str, List[Dict]]) -> Dict[str, Dict[int, str]]:
-    """
-    从输出文件加载已翻译的文本（通过比较原文和译文判断）
-    
-    返回: {"file_key": {idx: "translated_text"}}
-    """
-    if not output_file.exists():
-        return {}
-    
-    try:
-        with open(output_file, 'r', encoding='utf-8') as f:
-            output_data = json.load(f)
+def save_output_files(output_file: Path, texts_data: Dict[str, Any], texts_dict: Dict[str, Any], speakers_dict: Dict[str, str], file_lock: threading.Lock = None):
+    """保存输出文件"""
+    def _save():
+        # 确定保存的数据结构
+        save_data = texts_data if ("texts" in texts_data or "speakers" in texts_data) else texts_dict
         
-        # 处理嵌套结构
-        if "texts" in output_data:
-            output_texts_dict = output_data.get("texts", {})
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(save_data, f, ensure_ascii=False, indent=2)
+        
+        # 如果是直接结构且有speakers，也保存到单独的speakers_translated.json
+        if speakers_dict and not ("texts" in texts_data or "speakers" in texts_data):
+            speakers_output_file = output_file.parent / "speakers_translated.json"
+            try:
+                with open(speakers_output_file, 'w', encoding='utf-8') as f:
+                    json.dump(speakers_dict, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass  # 定期保存时静默失败
+    
+    if file_lock:
+        with file_lock:
+            _save()
+    else:
+        _save()
+
+
+def get_context(texts_list: List[Dict[str, Any]], current_idx: int, original_texts_list: List[Dict[str, Any]] = None, speakers_dict: Dict[str, str] = None, max_chars: int = CONTEXT_MAX_CHARS, max_items: int = CONTEXT_MAX_ITEMS) -> Tuple[List[str], List[str]]:
+    """
+    获取当前文本的前后文上下文（包含说话人信息）
+    前后文平均分配字符数，交替收集以保持平衡
+    
+    Args:
+        texts_list: 文本列表（当前翻译状态）
+        current_idx: 当前文本的索引
+        original_texts_list: 原文列表（可选，用于获取未翻译的上下文）
+        speakers_dict: 说话人翻译字典（可选，用于获取翻译后的说话人名称）
+        max_chars: 上下文最大字符数（前后文总字符数）
+        max_items: 前后文最多收集的条数（每条）
+    
+    Returns:
+        (前文列表, 后文列表) - 每个列表包含格式为"说话人：文本"的字符串
+    """
+    if not texts_list or current_idx < 0 or current_idx >= len(texts_list):
+        return [], []
+    
+    # 获取说话人名称（优先使用翻译后的，如果没有则使用原文）
+    def get_speaker_name(speaker_key: str) -> str:
+        if not speaker_key:
+            return ""
+        if speakers_dict and speaker_key in speakers_dict:
+            translated_speaker_raw = speakers_dict[speaker_key]
+            translated_speaker = (translated_speaker_raw.strip() if translated_speaker_raw else "") if translated_speaker_raw is not None else ""
+            if translated_speaker:
+                return translated_speaker
+        return speaker_key
+    
+    # 获取前后文的文本和说话人（优先使用已翻译的，如果没有则使用原文）
+    def get_text_and_speaker_at_idx(idx: int) -> Tuple[str, str]:
+        if 0 <= idx < len(texts_list):
+            item = texts_list[idx]
+            # 获取说话人
+            speaker_key_raw = item.get("speaker")
+            speaker_key = (speaker_key_raw.strip() if speaker_key_raw else "") if speaker_key_raw is not None else ""
+            speaker_name = get_speaker_name(speaker_key) if speaker_key else ""
+            
+            # 优先使用已翻译的文本
+            translated_raw = item.get("text")
+            translated = (translated_raw.strip() if translated_raw else "") if translated_raw is not None else ""
+            if translated:
+                return translated, speaker_name
+            # 如果没有翻译，尝试使用原文
+            if original_texts_list and idx < len(original_texts_list):
+                original_item = original_texts_list[idx]
+                original_text_raw = original_item.get("text")
+                original_text = (original_text_raw.strip() if original_text_raw else "") if original_text_raw is not None else ""
+                if original_text:
+                    # 如果原文中没有说话人信息，尝试从原文项中获取
+                    if not speaker_name:
+                        original_speaker_key_raw = original_item.get("speaker")
+                        original_speaker_key = (original_speaker_key_raw.strip() if original_speaker_key_raw else "") if original_speaker_key_raw is not None else ""
+                        speaker_name = get_speaker_name(original_speaker_key) if original_speaker_key else ""
+                    return original_text, speaker_name
+        return "", ""
+    
+    # 收集前文和后文（格式：说话人：文本）
+    before_texts = []
+    after_texts = []
+    before_chars = 0  # 前文字符数
+    after_chars = 0  # 后文字符数
+    total_chars = 0  # 前后文总字符数
+    
+    # 准备前后文的索引列表
+    before_indices = list(range(current_idx - 1, -1, -1))
+    after_indices = list(range(current_idx + 1, len(texts_list)))
+    
+    # 交替收集前后文，保持字符数大致平衡
+    before_idx = 0
+    after_idx = 0
+    
+    while total_chars < max_chars:
+        # 决定收集前文还是后文（优先收集字符数较少的一边，保持平衡）
+        collect_before = False
+        if before_idx < len(before_indices) and after_idx < len(after_indices):
+            # 如果前文字符数少于或等于后文，优先收集前文；否则收集后文
+            collect_before = (before_chars <= after_chars)
+        elif before_idx < len(before_indices):
+            collect_before = True
+        elif after_idx < len(after_indices):
+            collect_before = False
         else:
-            output_texts_dict = output_data
+            break  # 没有更多文本可收集
         
-        translated_dict = {}
-        for file_key, file_texts in output_texts_dict.items():
-            if file_key not in original_texts_dict:
+        # 检查条数限制
+        if collect_before:
+            if len(before_texts) >= max_items:
+                # 前文达到条数限制，尝试收集后文
+                if after_idx >= len(after_indices) or len(after_texts) >= max_items:
+                    break
+                collect_before = False
+        else:
+            if len(after_texts) >= max_items:
+                # 后文达到条数限制，尝试收集前文
+                if before_idx >= len(before_indices) or len(before_texts) >= max_items:
+                    break
+                collect_before = True
+        
+        # 收集前文
+        if collect_before and before_idx < len(before_indices):
+            i = before_indices[before_idx]
+            before_idx += 1
+            
+            text, speaker = get_text_and_speaker_at_idx(i)
+            if not text:
                 continue
             
-            translated_dict[file_key] = {}
-            for idx, item in enumerate(file_texts):
-                if idx < len(original_texts_dict[file_key]):
-                    original_text = original_texts_dict[file_key][idx].get("text", "").strip()
-                    # 如果原始文本为空，跳过（不恢复空字符串的翻译）
-                    if not original_text:
-                        continue
-                    
-                    translated_text = item.get("text", "").strip()
-                    # 如果翻译文本存在且与原文不同，说明已翻译
-                    if translated_text and translated_text != original_text:
-                        translated_dict[file_key][idx] = translated_text
+            # 格式化：说话人：文本
+            if speaker:
+                formatted_text = f"{speaker}：{text}"
+            else:
+                formatted_text = text
+            
+            text_len = len(formatted_text)
+            # 检查总字符数限制
+            if total_chars + text_len > max_chars:
+                break
+            
+            before_texts.insert(0, formatted_text)
+            before_chars += text_len
+            total_chars += text_len
         
-        return translated_dict
-    except Exception as e:
-        print(f"警告: 无法从输出文件加载已翻译内容: {e}")
+        # 收集后文
+        elif not collect_before and after_idx < len(after_indices):
+            i = after_indices[after_idx]
+            after_idx += 1
+            
+            text, speaker = get_text_and_speaker_at_idx(i)
+            if not text:
+                continue
+            
+            # 格式化：说话人：文本
+            if speaker:
+                formatted_text = f"{speaker}：{text}"
+            else:
+                formatted_text = text
+            
+            text_len = len(formatted_text)
+            # 检查总字符数限制
+            if total_chars + text_len > max_chars:
+                break
+            
+            after_texts.append(formatted_text)
+            after_chars += text_len
+            total_chars += text_len
+        else:
+            break  # 无法继续收集
+    
+    return before_texts, after_texts
+
+
+def get_speaker_context(speaker_key: str, texts_dict: Dict[str, List[Dict[str, Any]]], original_texts_dict: Dict[str, List[Dict[str, Any]]] = None, max_texts: int = 5) -> List[str]:
+    """
+    获取某个 speaker 对应的前几条文本作为上下文
+    
+    Args:
+        speaker_key: 说话人键
+        texts_dict: 文本字典（当前翻译状态）
+        original_texts_dict: 原文字典（可选，用于获取未翻译的文本）
+        max_texts: 最多返回的文本数量
+    
+    Returns:
+        文本列表（格式：说话人：文本，如果没有说话人则只有文本）
+    """
+    context_texts = []
+    
+    # 遍历所有文件，查找使用该 speaker 的文本项
+    for file_key, file_texts in texts_dict.items():
+        if len(context_texts) >= max_texts:
+            break
+        
+        # 获取原文列表（如果存在）
+        original_file_texts = original_texts_dict.get(file_key, []) if original_texts_dict else []
+        
+        # 遍历该文件的所有文本项
+        for idx, item in enumerate(file_texts):
+            if len(context_texts) >= max_texts:
+                break
+            
+            # 检查是否使用该 speaker
+            item_speaker_raw = item.get("speaker")
+            item_speaker = (item_speaker_raw.strip() if item_speaker_raw else "") if item_speaker_raw is not None else ""
+            if item_speaker != speaker_key:
+                continue
+            
+            # 获取文本（优先使用已翻译的）
+            text_raw = item.get("text")
+            text = (text_raw.strip() if text_raw else "") if text_raw is not None else ""
+            if not text and original_file_texts and idx < len(original_file_texts):
+                original_item = original_file_texts[idx]
+                original_text_raw = original_item.get("text")
+                text = (original_text_raw.strip() if original_text_raw else "") if original_text_raw is not None else ""
+            
+            if text:
+                # 格式化：说话人：文本（但这里说话人就是我们要翻译的，所以只显示文本）
+                context_texts.append(text)
+    
+    return context_texts[:max_texts]
+
+
+def extract_relevant_terms(text: str, terms: Dict[str, str], max_terms: int = 20) -> Dict[str, str]:
+    """
+    从文本中提取相关的术语（只返回文本中出现的术语）
+    
+    Args:
+        text: 要翻译的文本
+        terms: 完整的术语表
+        max_terms: 最多返回的术语数量（避免提示过长）
+    
+    Returns:
+        相关的术语字典
+    """
+    if not terms or not text:
         return {}
+    
+    relevant = {}
+    # 按术语长度从长到短排序，优先匹配长术语
+    sorted_terms = sorted(terms.items(), key=lambda x: len(x[0]), reverse=True)
+    
+    for original, translated in sorted_terms:
+        if original in text:
+            relevant[original] = translated
+            if len(relevant) >= max_terms:
+                break
+    
+    return relevant
 
 
-def translate_text(text: str, api_key: str, source_lang: str = "日语", target_lang: str = "简体中文") -> Tuple[Optional[str], Optional[str]]:
+def calculate_prompt_base_chars(text: str, terms: Dict[str, str] = None, speaker: str = None) -> int:
+    """
+    计算 prompt 基础部分的字符数（system message + user message 基础部分，不包括上下文）
+    
+    Args:
+        text: 要翻译的文本
+        terms: 术语表
+        speaker: 说话人
+    
+    Returns:
+        基础部分的字符数
+    """
+    # 提取相关术语
+    relevant_terms = extract_relevant_terms(text, terms or {}, max_terms=20)
+    
+    # 构建术语表部分
+    terms_section = ""
+    if relevant_terms:
+        terms_list = []
+        for original, translated in sorted(relevant_terms.items()):
+            terms_list.append(f'  "{original}" → "{translated}"')
+        terms_text = "\n".join(terms_list)
+        terms_section = f"""
+【术语表（必须严格遵守）】
+以下术语在文本中出现，翻译时必须严格使用这些标准翻译，不得自行翻译或更改：
+{terms_text}
+
+**重要**：如果文本中出现上述术语，必须使用对应的中文翻译。
+"""
+    
+    # System message 基础部分（固定内容）
+    system_base = """
+你正在翻译《女神异闻录2 罚》（Persona 2: Eternal Punishment）的文本。
+
+【翻译总则】
+1. 所有翻译输出必须为**自然流畅的简体中文**。
+2. **绝对禁止音译罗马字母**（例如：Maya、Katsuya、Fujii、Okamura 等全部禁止出现）。
+3. 人名、角色名、地名、组织名：
+   - 若原文包含汉字：**保留汉字原文作为最终译名**。
+   - 若原文仅为假名且已有通用中文译名：采用通用译名。
+   - 若无通用译名：保留假名形式，不得转写为罗马字母。
+4. 不允许擅自更改、提升、弱化或戏谑语义。禁止添加感情色彩和外号。例如：
+   - "新人"不可擅自翻为"新人大佬"
+   - "うらら"不可翻成"晴朗明媚"
+5. 职称、身份、关系称谓需符合中文自然表达，保持正式、准确，不得英文化或乱加"Mr."、"Editor-in-Chief"等非原文信息。
+   - 例："編集長" → "主编"
+   - 不得翻译为 "Editor-in-Chief"
+6. 只输出翻译，不添加解释、注释或额外说明。
+
+【表达要求】
+1. 对话用语气自然口语化，但不改变原文语气。
+2. 同一角色、称呼在全文中必须保持一致。
+3. 不可输出词典式映射表，翻译任务中仅处理给出的实际文本。
+- 日语称谓（先生、校長、編集長等）必须根据原文语义和上下文翻译为中文自然称呼。
+- 保留角色职业/身份，不允许泛化或硬套"先生""Mr."、"Editor-in-Chief"等。
+- 翻译每条文本时，模型必须参考前后上下文、角色身份、情绪和场景。
+- 代词、称谓和动作描述必须结合上下文理解。
+
+
+【重点禁止项（必须严格执行）】
+- 禁止出现任何罗马字母拼写的人名：（如 Maya / Katsuya / Fujii / Kashiwara等）
+- 禁止擅自意译增加形容色彩：（如"うらら"翻成"晴朗明媚"）
+- 禁止将汉字人名改成其他汉字：（如"黛ゆきの"绝不可变成"真弓雪乃"）
+- 禁止英文化称谓：（如 "Mr. Saeko"、"Editor-in-Chief"、"Mr. Asō" 等）
+
+【固有代号指令】
+游戏中以全大写方式呈现的代号（如：ＪＯＫＥＲ、ＮＡＴＩＯＮＡＬＦＬＡＧ 等），视为专用符号单位。
+此类词汇：
+1) 不翻译；
+2) 不加注音；
+3) 不转换字形和大小写；
+4) **严格按原文保留**。
+
+{terms_section}
+
+最终目标：在不破坏原文意义和角色特征前提下，使翻译自然清晰、统一、可读。
+    """
+    
+    system_message = system_base.format(terms_section=terms_section)
+    
+    # User message 基础部分（新的结构：上下文信息和翻译文本分开）
+    # 上下文信息部分（如果有说话人）
+    context_message_base = ""
+    if speaker:
+        context_message_base = f"以下是上下文信息（仅用于理解语境和角色身份，不要翻译这些内容）：\n【说话人】：{speaker}"
+    
+    # 翻译文本部分
+    translate_message_base = f"请翻译以下文本（只输出翻译后的纯文本内容）：\n{text}"
+    
+    # 计算总字符数（system message + 上下文 message + 翻译 message）
+    total_chars = len(system_message)
+    if context_message_base:
+        total_chars += len(context_message_base)
+    total_chars += len(translate_message_base)
+    
+    return total_chars
+
+
+def translate_text(text: str, api_key: str, source_lang: str = "日语", target_lang: str = "简体中文", terms: Dict[str, str] = None, context_before: List[str] = None, context_after: List[str] = None, speaker: str = None, is_speaker_translation: bool = False) -> Tuple[Optional[str], Optional[str]]:
     """
     使用 GPT API 翻译文本
     
@@ -132,11 +455,23 @@ def translate_text(text: str, api_key: str, source_lang: str = "日语", target_
         api_key: API 密钥
         source_lang: 源语言
         target_lang: 目标语言
+        terms: 术语表
+        context_before: 前文列表（格式：说话人：文本）或 speaker 对应的文本列表
+        context_after: 后文列表（格式：说话人：文本）
+        speaker: 当前文本的说话人（可选）
+        is_speaker_translation: 是否为翻译 speaker（用于调整上下文提示）
     
     返回 (翻译后的文本, 错误信息)
     成功时返回 (translated_text, None)
     失败时返回 (None, error_message)
     """
+    if terms is None:
+        terms = {}
+    if context_before is None:
+        context_before = []
+    if context_after is None:
+        context_after = []
+    
     try:
         import requests
     except ImportError:
@@ -149,57 +484,124 @@ def translate_text(text: str, api_key: str, source_lang: str = "日语", target_
         "Content-Type": "application/json"
     }
     
-    # 游戏控制字符列表（需要原样保留）
-    control_chars_info = """
-游戏控制字符（必须原样保留，不要翻译）：
-    以 [ 开头，以 ] 结尾
-    连大小写都不准改变
+    # 提取文本中相关的术语（最多20个，避免提示过长）
+    relevant_terms = extract_relevant_terms(text, terms, max_terms=20)
+    
+    # 构建术语表部分（只在有相关术语时添加）
+    terms_section = ""
+    if relevant_terms:
+        terms_list = []
+        for original, translated in sorted(relevant_terms.items()):
+            terms_list.append(f'  "{original}" → "{translated}"')
+        terms_text = "\n".join(terms_list)
+        terms_section = f"""
+【术语表（必须严格遵守）】
+以下术语在文本中出现，翻译时必须严格使用这些标准翻译，不得自行翻译或更改：
+{terms_text}
+
+**重要**：如果文本中出现上述术语，必须使用对应的中文翻译。
 """
     
     # System message: 翻译规则和原则（作为系统级指令）
-    system_message = f"""你正在翻译《女神异闻录2 罚》（Persona 2: Eternal Punishment）这款日本RPG游戏的文本。
+    system_message = f"""
+你正在翻译《女神异闻录2 罚》（Persona 2: Eternal Punishment）的文本。
 
-{control_chars_info}
+【翻译总则】
+1. 所有翻译输出必须为**自然流畅的简体中文**。
+2. **绝对禁止音译罗马字母**（例如：Maya、Katsuya、Fujii、Okamura 等全部禁止出现）。
+3. 人名、角色名、地名、组织名：
+   - 若原文包含汉字：**保留汉字原文作为最终译名**。
+   - 若原文仅为假名且已有通用中文译名：采用通用译名。
+   - 若无通用译名：保留假名形式，不得转写为罗马字母。
+4. 不允许擅自更改、提升、弱化或戏谑语义。禁止添加感情色彩和外号。例如：
+   - “新人”不可擅自翻为“新人大佬”
+   - “うらら”不可翻成“晴朗明媚”
+5. 职称、身份、关系称谓需符合中文自然表达，保持正式、准确，不得英文化或乱加“Mr.”、“Editor-in-Chief”等非原文信息。
+   - 例：“編集長” → “主编”
+   - 不得翻译为 “Editor-in-Chief”
+6. 只输出翻译，不添加解释、注释或额外说明。
 
-【核心翻译原则】
-1. 必须理解日语的完整语义和语法结构，绝对禁止音译
-2. 片假名和平假名只是书写方式不同，读音和语义完全相同，必须按照语义翻译
-3. 必须结合上下文理解文本的完整含义，包括语境、情感色彩、角色关系和场景背景
-4. 日语助词和语法结构必须正确理解，不能音译或忽略
-5. 遇到任何假名（平假名或片假名）时，必须先理解其语义，再翻译成对应的中文
+【表达要求】
+1. 对话用语气自然口语化，但不改变原文语气。
+2. 同一角色、称呼在全文中必须保持一致。
+3. 不可输出词典式映射表，翻译任务中仅处理给出的实际文本。
+- 日语称谓（先生、校長、編集長等）必须根据原文语义和上下文翻译为中文自然称呼。
+- 保留角色职业/身份，不允许泛化或硬套“先生”“Mr.”、“Editor-in-Chief”等。
+- 翻译每条文本时，模型必须参考前后上下文、角色身份、情绪和场景。
+- 代词、称谓和动作描述必须结合上下文理解。
 
-对于包含日语文字的文本，你必须将其翻译为简体中文。
 
-翻译质量要求：
-1. 翻译要自然流畅，符合中文表达习惯
-2. 保持游戏文本的风格和语气，符合RPG游戏的语境
-3. 保持角色的性格特点
-4. 保持原文的情感色彩和语调（如感叹、疑问、陈述、威胁、警告等）
-5. 对话要口语化，符合角色身份和场景
-6. 专有名词（人名、地名、组织名等）保持原样或使用常见译名
-7. 保持原文的修辞手法和语言特色
+【重点禁止项（必须严格执行）】
+- 禁止出现任何罗马字母拼写的人名：（如 Maya / Katsuya / Fujii / Kashiwara等）
+- 禁止擅自意译增加形容色彩：（如“うらら”翻成“晴朗明媚”）
+- 禁止将汉字人名改成其他汉字：（如“黛ゆきの”绝不可变成“真弓雪乃”）
+- 禁止英文化称谓：（如 “Mr. Saeko”、“Editor-in-Chief”、“Mr. Asō” 等）
 
-要求：
-1. 只返回翻译结果，不要添加任何解释、注释或提示文本
-2. 绝对禁止音译，必须理解完整语义后再翻译
-3. 无论文本使用平假名还是片假名，都必须按照语义翻译"""
+【固有代号指令】
+游戏中以全大写方式呈现的代号（如：ＪＯＫＥＲ、ＮＡＴＩＯＮＡＬＦＬＡＧ 等），视为专用符号单位。
+此类词汇：
+1) 不翻译；
+2) 不加注音；
+3) 不转换字形和大小写；
+4) **严格按原文保留**。
+
+{terms_section}
+
+最终目标：在不破坏原文意义和角色特征前提下，使翻译自然清晰、统一、可读。
+
+
+
+
+    """
     
-    # User message: 需要翻译的具体文本
-    user_message = f"请翻译以下文本：\n{text}"
+    # 构建消息列表
+    messages = [
+        {
+            "role": "system",
+            "content": system_message
+        }
+    ]
+    
+    # 如果有说话人信息或上下文，先作为单独的 user message 发送（仅用于理解，不翻译）
+    context_info_parts = []
+    if speaker:
+        context_info_parts.append(f"【说话人】：{speaker}")
+    
+    if context_before or context_after:
+        if context_before:
+            if is_speaker_translation:
+                context_info_parts.append("【该说话人对应的文本示例】")
+            else:
+                context_info_parts.append("【前文】")
+            for i, ctx_text in enumerate(context_before, 1):
+                context_info_parts.append(f"{i}. {ctx_text}")
+        if context_after:
+            context_info_parts.append("【后文】")
+            for i, ctx_text in enumerate(context_after, 1):
+                context_info_parts.append(f"{i}. {ctx_text}")
+    
+    # 如果有上下文信息，先发送一个 user message 提供上下文
+    if context_info_parts:
+        context_message = "以下是上下文信息（仅用于理解语境和角色身份，不要翻译这些内容）：\n" + "\n".join(context_info_parts)
+        messages.append({
+            "role": "user",
+            "content": context_message
+        })
+    
+    # 最后发送要翻译的文本
+    messages.append({
+        "role": "user",
+        "content": f"请翻译以下文本（只输出翻译后的纯文本内容）：\n{text}"
+    })
     
     data = {
         "model": MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_message
-            },
-            {
-                "role": "user",
-                "content": user_message
-            }
-        ],
-        "temperature": 0.3
+        "messages": messages,
+        "temperature": 0.7,
+        "TopP":0.8,
+         "TopK":20,
+         "MinP":0,
+           "stream": False,
     }
     
     for attempt in range(MAX_RETRIES):
@@ -257,7 +659,7 @@ def translate_text(text: str, api_key: str, source_lang: str = "日语", target_
     return None, "达到最大重试次数"
 
 
-def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Path = None, dry_run: bool = False, debug: bool = False, max_workers: int = 5, debug_limit: int = 5, progress_file: Path = None, resume: bool = True, retry_failed: bool = False):
+def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Path = None, dry_run: bool = False, debug: bool = False, max_workers: int = 5, debug_limit: int = 5, progress_file: Path = None, resume: bool = True, retry_failed: bool = False, max_tasks: int = None):
     """
     批量翻译 texts.json 中的文本，保存到新文件
     
@@ -272,6 +674,7 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
         progress_file: 进度记录文件路径（如果为 None，则自动生成）
         resume: 如果为 True，从进度文件恢复已翻译的文本
         retry_failed: 如果为 True，重试之前失败的文本
+        max_tasks: 最大任务数限制（None 表示不限制）
     """
     # 加载 API 密钥
     api_key = load_api_key(api_key_file)
@@ -293,12 +696,20 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
     print(f"输出文件: {output_file}")
     print(f"进度文件: {progress_file}")
     
-    # 读取 texts.json
+    # 读取原文 texts.json
     with open(texts_file, 'r', encoding='utf-8') as f:
-        texts_data = json.load(f)
+        original_texts_data = json.load(f)
     
-    # 深拷贝数据，避免修改原数据
-    texts_data = copy.deepcopy(texts_data)
+    # 深拷贝原文数据，用于比较和获取原文
+    original_texts_data = copy.deepcopy(original_texts_data)
+    
+    # 处理原文结构
+    if "texts" in original_texts_data and "speakers" in original_texts_data:
+        original_texts_dict = original_texts_data.get("texts", {})
+        original_speakers_dict = original_texts_data.get("speakers", {})
+    else:
+        original_texts_dict = original_texts_data
+        original_speakers_dict = {}
     
     # 加载或初始化进度记录
     if resume or retry_failed:
@@ -312,15 +723,50 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
         progress_data = init_progress(texts_file, output_file)
         print("不使用进度记录（从头开始）")
     
-    # texts.json 结构: {"E0000": [...], "E0001": [...], ...}
-    # 如果包含 "speakers" 和 "texts" 键，则使用嵌套结构
-    if "texts" in texts_data and "speakers" in texts_data:
-        texts_dict = texts_data.get("texts", {})
-        speakers_dict = texts_data.get("speakers", {})
+    # 加载已翻译的译文（从输出文件，如果存在）
+    # 这是我们要维护和更新的译文数据
+    if output_file.exists():
+        try:
+            with open(output_file, 'r', encoding='utf-8') as f:
+                translated_texts_data = json.load(f)
+            print(f"从输出文件加载已翻译的译文: {output_file}")
+        except Exception as e:
+            print(f"警告: 无法读取输出文件，将从头开始: {e}")
+            translated_texts_data = None
     else:
-        # 直接结构，以文件名作为键
-        texts_dict = texts_data
-        speakers_dict = {}
+        translated_texts_data = None
+    
+    # 初始化译文数据结构（基于原文结构）
+    if translated_texts_data:
+        # 如果输出文件存在，使用其结构
+        if "texts" in translated_texts_data and "speakers" in translated_texts_data:
+            texts_dict = translated_texts_data.get("texts", {})
+            speakers_dict = translated_texts_data.get("speakers", {})
+        else:
+            texts_dict = translated_texts_data
+            speakers_dict = {}
+        
+        # 确保所有原文中的文件都在译文中（用原文填充缺失的部分）
+        for file_key, file_texts in original_texts_dict.items():
+            if file_key not in texts_dict:
+                # 如果译文中没有这个文件，用原文初始化
+                texts_dict[file_key] = copy.deepcopy(file_texts)
+            else:
+                # 如果译文中已有这个文件，确保所有条目都存在（用原文填充缺失的）
+                for idx, original_item in enumerate(file_texts):
+                    if idx >= len(texts_dict[file_key]):
+                        texts_dict[file_key].append(copy.deepcopy(original_item))
+                    else:
+                        # 如果译文中的文本为空或与原文相同，保持原文（待翻译）
+                        translated_text = texts_dict[file_key][idx].get("text", "").strip()
+                        original_text = original_item.get("text", "").strip()
+                        if not translated_text or translated_text == original_text:
+                            # 保持结构，但文本保持原文（待翻译）
+                            texts_dict[file_key][idx] = copy.deepcopy(original_item)
+    else:
+        # 如果输出文件不存在，用原文初始化译文
+        texts_dict = copy.deepcopy(original_texts_dict)
+        speakers_dict = copy.deepcopy(original_speakers_dict) if original_speakers_dict else {}
     
     # 如果 speakers_dict 为空，尝试从单独的 speakers.json 文件读取
     if not speakers_dict:
@@ -333,85 +779,34 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
             except Exception as e:
                 print(f"警告: 无法读取 speakers.json: {e}")
     
-    # 从输出文件和进度文件恢复已翻译的文本
+    # 优先从 speakers_translated.json 加载已翻译的值（如果存在）
+    speakers_translated_file = texts_file.parent / "speakers_translated.json"
+    if speakers_translated_file.exists() and speakers_dict:
+        try:
+            with open(speakers_translated_file, 'r', encoding='utf-8') as f:
+                speakers_translated = json.load(f)
+            # 更新 speakers_dict，使用已翻译的值（只更新非空值）
+            updated_count = 0
+            for key, translated_value in speakers_translated.items():
+                if key in speakers_dict and translated_value and translated_value.strip():
+                    speakers_dict[key] = translated_value
+                    updated_count += 1
+            if updated_count > 0:
+                print(f"从 {speakers_translated_file} 恢复了 {updated_count} 个已翻译的 speakers")
+        except Exception as e:
+            print(f"警告: 无法读取 speakers_translated.json: {e}")
+    
+    # 加载术语表（从 speakers_translated copy.json）
+    terms_file = texts_file.parent / "speakers_translated copy.json"
+    terms = load_terms(terms_file)
+    if terms:
+        print(f"已加载术语表: {len(terms)} 个术语（从 {terms_file}）")
+    else:
+        print(f"未找到术语表文件 {terms_file}，将不使用术语表")
+    
+    # 从进度文件读取已完成和失败的索引
     completed_dict = progress_data.get("completed", {})
     failed_dict = progress_data.get("failed", {})
-    progress_version = progress_data.get("version", "1.0")
-    restored_count = 0
-    
-    # 保存原始 texts_dict 用于比较
-    original_texts_dict = copy.deepcopy(texts_dict)
-    
-    if resume:
-        # 从输出文件恢复已翻译的内容
-        translated_from_output = load_translated_from_output(output_file, original_texts_dict)
-        
-        # 根据进度文件中的索引恢复
-        for file_key in completed_dict:
-            if file_key not in texts_dict:
-                continue
-            
-            completed_items = completed_dict[file_key]
-            
-            # 处理新格式（索引列表）和旧格式（字典）
-            if isinstance(completed_items, list):
-                # 新格式：索引列表
-                for idx in completed_items:
-                    if isinstance(idx, int) and 0 <= idx < len(texts_dict[file_key]):
-                        # 检查原始文本是否为空，如果为空则跳过
-                        original_text = original_texts_dict[file_key][idx].get("text", "").strip()
-                        if not original_text:
-                            continue
-                        
-                        # 优先从输出文件恢复
-                        if file_key in translated_from_output and idx in translated_from_output[file_key]:
-                            texts_dict[file_key][idx]["text"] = translated_from_output[file_key][idx]
-                            restored_count += 1
-            else:
-                # 旧格式：字典 {idx: translated_text}
-                for idx_str, translated_text in completed_items.items():
-                    try:
-                        idx = int(idx_str)
-                        if 0 <= idx < len(texts_dict[file_key]):
-                            # 检查原始文本是否为空，如果为空则跳过
-                            original_text = original_texts_dict[file_key][idx].get("text", "").strip()
-                            if not original_text:
-                                continue
-                            
-                            # 优先从输出文件恢复，否则使用进度文件中的内容
-                            if file_key in translated_from_output and idx in translated_from_output[file_key]:
-                                texts_dict[file_key][idx]["text"] = translated_from_output[file_key][idx]
-                            else:
-                                texts_dict[file_key][idx]["text"] = translated_text
-                            restored_count += 1
-                    except (ValueError, IndexError):
-                        pass
-        
-        # 恢复输出文件中有但进度文件中没有的（可能进度文件丢失）
-        for file_key, translated_items in translated_from_output.items():
-            if file_key not in texts_dict:
-                continue
-            for idx, translated_text in translated_items.items():
-                # 检查原始文本是否为空，如果为空则跳过
-                if 0 <= idx < len(original_texts_dict.get(file_key, [])):
-                    original_text = original_texts_dict[file_key][idx].get("text", "").strip()
-                    if not original_text:
-                        continue
-                
-                # 检查是否已在进度文件中
-                is_in_progress = False
-                if file_key in completed_dict:
-                    if isinstance(completed_dict[file_key], list):
-                        is_in_progress = idx in completed_dict[file_key]
-                    else:
-                        is_in_progress = str(idx) in completed_dict[file_key]
-                
-                if not is_in_progress and 0 <= idx < len(texts_dict[file_key]):
-                    texts_dict[file_key][idx]["text"] = translated_text
-                    restored_count += 1
-    
-    if restored_count > 0:
-        print(f"从输出文件和进度文件恢复了 {restored_count} 个已翻译的文本")
     
     total_texts = 0
     translated_count = 0
@@ -420,7 +815,8 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
     # 统计文本数量
     for file_key, file_texts in texts_dict.items():
         for item in file_texts:
-            text = item.get("text", "").strip()
+            text_raw = item.get("text")
+            text = (text_raw.strip() if text_raw else "") if text_raw is not None else ""
             if text:
                 total_texts += 1
             else:
@@ -450,37 +846,6 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
         # 创建 speaker_keys 列表用于索引映射（不存储到 progress）
         speaker_keys = list(speakers_dict.keys())
         
-        # 从 speakers_translated.json 恢复已翻译的 speakers
-        if resume:
-            # 尝试从输出文件恢复（嵌套结构）
-            if output_file.exists():
-                try:
-                    with open(output_file, 'r', encoding='utf-8') as f:
-                        output_data = json.load(f)
-                    if "speakers" in output_data:
-                        output_speakers = output_data["speakers"]
-                        for speaker_key in speaker_keys:
-                            if speaker_key in output_speakers:
-                                translated_value = output_speakers[speaker_key]
-                                if translated_value and translated_value.strip():
-                                    speakers_dict[speaker_key] = translated_value
-                except Exception as e:
-                    print(f"警告: 从输出文件恢复 speakers 失败: {e}")
-            
-            # 尝试从单独的 speakers_translated.json 文件恢复（直接结构）
-            speakers_translated_file = texts_file.parent / "speakers_translated.json"
-            if speakers_translated_file.exists():
-                try:
-                    with open(speakers_translated_file, 'r', encoding='utf-8') as f:
-                        output_speakers = json.load(f)
-                    for speaker_key in speaker_keys:
-                        if speaker_key in output_speakers:
-                            translated_value = output_speakers[speaker_key]
-                            if translated_value and translated_value.strip():
-                                speakers_dict[speaker_key] = translated_value
-                except Exception as e:
-                    print(f"警告: 从 speakers_translated.json 恢复失败: {e}")
-            
         # 收集需要翻译的 speakers（根据 speakers_translated.json 中的值判断）
         speakers_to_translate = []
         
@@ -511,9 +876,19 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
                 
                 speaker_key = speaker_keys[speaker_idx]
                 
-                print(f"  [{speaker_idx+1}/{len(speaker_keys)}] 翻译 speaker: {speaker_key[:50]}...")
+                # 获取该 speaker 对应的前几条文本作为上下文
+                speaker_context = get_speaker_context(speaker_key, texts_dict, original_texts_dict, max_texts=5)
                 
-                translated, error_msg = translate_text(speaker_key, api_key)
+                context_info = ""
+                if speaker_context:
+                    context_info = f" [上下文: {len(speaker_context)}条文本]"
+                
+                print(f"  [{speaker_idx+1}/{len(speaker_keys)}] 翻译 speaker: {speaker_key[:50]}...{context_info}")
+                
+                # 将上下文转换为字符串列表格式（用于 translate_text 的 context_before 参数）
+                context_before = speaker_context if speaker_context else None
+                
+                translated, error_msg = translate_text(speaker_key, api_key, terms=terms, context_before=context_before, is_speaker_translation=True)
                 
                 with speakers_progress_lock:
                     if translated:
@@ -560,26 +935,18 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
                             # 定期保存进度
                             completed_speakers_count += 1
                             if completed_speakers_count % speakers_save_interval == 0 or completed_speakers_count == len(speakers_to_translate):
-                                # 保存输出文件和进度文件
-                                if "texts" in texts_data or "speakers" in texts_data:
-                                    texts_data["texts"] = texts_dict
-                                    texts_data["speakers"] = speakers_dict
-                                    save_data = texts_data
+                                # 构建要保存的译文数据
+                                if "texts" in original_texts_data or "speakers" in original_texts_data:
+                                    # 嵌套结构
+                                    save_data = {
+                                        "texts": texts_dict,
+                                        "speakers": speakers_dict
+                                    }
                                 else:
+                                    # 直接结构
                                     save_data = texts_dict
                                 
-                                with speakers_file_lock:
-                                    with open(output_file, 'w', encoding='utf-8') as f:
-                                        json.dump(save_data, f, ensure_ascii=False, indent=2)
-                                    
-                                    # 如果是直接结构且有speakers，也保存到单独的speakers_translated.json（不覆盖原文件）
-                                    if speakers_dict and not ("texts" in texts_data or "speakers" in texts_data):
-                                        speakers_output_file = output_file.parent / "speakers_translated.json"
-                                        try:
-                                            with open(speakers_output_file, 'w', encoding='utf-8') as f:
-                                                json.dump(speakers_dict, f, ensure_ascii=False, indent=2)
-                                        except Exception as e:
-                                            pass  # 定期保存时静默失败，避免输出太多
+                                save_output_files(output_file, save_data, texts_dict, speakers_dict, speakers_file_lock)
                                 
                                 # 保存进度文件
                                 with speakers_progress_lock:
@@ -619,32 +986,23 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
             speakers_completed_count = speakers_completed_count_local
             speakers_failed_count = speakers_failed_count_local
             
-            # 最终保存
-            if "texts" in texts_data or "speakers" in texts_data:
-                texts_data["texts"] = texts_dict
-                texts_data["speakers"] = speakers_dict
-                save_data = texts_data
+            # 最终保存译文数据
+            if "texts" in original_texts_data or "speakers" in original_texts_data:
+                # 嵌套结构
+                save_data = {
+                    "texts": texts_dict,
+                    "speakers": speakers_dict
+                }
             else:
+                # 直接结构
                 save_data = texts_dict
-                if speakers_dict:
-                    speakers_output_file = output_file.parent / "speakers_translated.json"
-                    try:
-                        with open(speakers_output_file, 'w', encoding='utf-8') as f:
-                            json.dump(speakers_dict, f, ensure_ascii=False, indent=2)
-                        print(f"Speakers 已保存到: {speakers_output_file}")
-                    except Exception as e:
-                        print(f"警告: 保存 speakers_translated.json 失败: {e}")
             
-            try:
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    json.dump(save_data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"警告: 保存输出文件失败: {e}")
+            save_output_files(output_file, save_data, texts_dict, speakers_dict)
             
-            # 计算统计信息（直接从 speakers_dict 计算）
+            # 计算统计信息
             speakers_completed_total = sum(1 for v in speakers_dict.values() if v and v.strip())
             
-            # 保存进度文件（不包含 speakers 信息）
+            # 保存进度文件
             with speakers_progress_lock:
                 save_progress(progress_file, progress_data)
             
@@ -674,32 +1032,33 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
     
     for file_key, file_texts in texts_dict.items():
         for idx, item in enumerate(file_texts):
-            original_text = item.get("text", "").strip()
-            # 跳过空字符串
+            # 从 original_texts_dict 读取原文，如果不存在则从 item 读取
+            if file_key in original_texts_dict and idx < len(original_texts_dict[file_key]):
+                original_text_raw = original_texts_dict[file_key][idx].get("text")
+                original_text = (original_text_raw.strip() if original_text_raw else "") if original_text_raw is not None else ""
+            else:
+                text_raw = item.get("text")
+                original_text = (text_raw.strip() if text_raw else "") if text_raw is not None else ""
+            
             if not original_text:
                 continue
             
-            # 检查是否已完成（支持新旧格式）
-            is_completed = False
-            if file_key in completed_dict:
-                completed_items = completed_dict[file_key]
-                if isinstance(completed_items, list):
-                    # 新格式：索引列表
-                    is_completed = idx in completed_items
-                else:
-                    # 旧格式：字典
-                    is_completed = str(idx) in completed_items
+            # 获取 item 的 id（用于进度记录）
+            item_id = item.get("id")
+            if not item_id:
+                # 如果没有 id，使用 idx 作为后备（兼容旧格式）
+                item_id = str(idx)
             
-            # 检查是否是失败的文本（支持新旧格式）
-            is_failed = False
-            if file_key in failed_dict:
-                failed_items = failed_dict[file_key]
-                if isinstance(failed_items, list):
-                    # 新格式：索引列表
-                    is_failed = idx in failed_items
-                else:
-                    # 旧格式：字典（兼容处理）
-                    is_failed = str(idx) in failed_items
+            # 检查进度记录版本，兼容旧格式（使用 idx）
+            progress_version = progress_data.get("version", "1.1")
+            if progress_version < "1.2":
+                # 旧版本使用 idx
+                is_completed = idx in completed_dict.get(file_key, [])
+                is_failed = idx in failed_dict.get(file_key, [])
+            else:
+                # 新版本使用 id
+                is_completed = item_id in completed_dict.get(file_key, [])
+                is_failed = item_id in failed_dict.get(file_key, [])
             
             # 如果已完成且不是重试失败模式，跳过
             if is_completed and not retry_failed:
@@ -710,17 +1069,24 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
             if retry_failed and not is_failed:
                 continue
             
-            # 如果是重试失败的文本，记录
             if retry_failed and is_failed:
                 retry_count += 1
+            
+            # 获取说话人信息
+            speaker_key_raw = item.get("speaker")
+            speaker_key = (speaker_key_raw.strip() if speaker_key_raw else "") if speaker_key_raw is not None else ""
             
             tasks.append({
                 "file_key": file_key,
                 "idx": idx,
+                "item_id": item_id,  # 添加 item_id
                 "item": item,
                 "text": original_text,
                 "total_in_file": len(file_texts),
-                "is_retry": is_failed
+                "is_retry": is_failed,
+                "file_texts": file_texts,  # 传递整个文件文本列表用于获取上下文
+                "original_file_texts": original_texts_dict.get(file_key, []),  # 传递原文列表
+                "speaker_key": speaker_key  # 传递说话人键
             })
     
     if skipped_count > 0:
@@ -728,10 +1094,14 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
     if retry_count > 0:
         print(f"准备重试失败的文本: {retry_count} 个")
     
-    # 调试模式限制任务数量
+    # 限制任务数量
+    original_task_count = len(tasks)
     if debug:
         tasks = tasks[:debug_limit]
         print(f"调试模式: 限制任务数为 {len(tasks)}")
+    elif max_tasks is not None and max_tasks > 0:
+        tasks = tasks[:max_tasks]
+        print(f"任务数限制: 从 {original_task_count} 个任务限制为 {len(tasks)} 个")
     
     if not tasks:
         print("没有需要翻译的任务")
@@ -751,10 +1121,14 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
         
         file_key = task_info["file_key"]
         idx = task_info["idx"]
+        item_id = task_info.get("item_id", str(idx))  # 获取 item_id，如果没有则使用 idx
         item = task_info["item"]
         original_text = task_info["text"]
         total_in_file = task_info["total_in_file"]
         is_retry = task_info.get("is_retry", False)
+        file_texts = task_info.get("file_texts", [])
+        original_file_texts = task_info.get("original_file_texts", [])
+        speaker_key = task_info.get("speaker_key", "")
         
         # 再次检查空字符串（防止意外情况）
         if not original_text or not original_text.strip():
@@ -766,71 +1140,77 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
             if debug and current_completed >= debug_limit:
                 return False
         
-        retry_prefix = "[重试] " if is_retry else ""
-        print(f"  {retry_prefix}[{file_key}][{idx+1}/{total_in_file}] 翻译: {original_text[:50]}...")
+        # 获取说话人名称（优先使用翻译后的）
+        speaker_name = ""
+        if speaker_key:
+            if speakers_dict and speaker_key in speakers_dict:
+                translated_speaker_raw = speakers_dict[speaker_key]
+                translated_speaker = (translated_speaker_raw.strip() if translated_speaker_raw else "") if translated_speaker_raw is not None else ""
+                if translated_speaker:
+                    speaker_name = translated_speaker
+                else:
+                    speaker_name = speaker_key
+            else:
+                speaker_name = speaker_key
         
-        translated, error_msg = translate_text(original_text, api_key)
+        # 计算 prompt 基础部分的字符数
+        prompt_base_chars = calculate_prompt_base_chars(original_text, terms, speaker_name)
+        # 计算可用于上下文的字符数（总限制减去基础部分）
+        available_context_chars = max(0, CONTEXT_MAX_CHARS - prompt_base_chars)
+        
+        # 获取上下文（包含说话人信息），使用剩余可用字符数
+        context_before, context_after = get_context(file_texts, idx, original_file_texts, speakers_dict, available_context_chars)
+        
+        retry_prefix = "[重试] " if is_retry else ""
+        context_info = ""
+        if context_before or context_after:
+            context_info = f" [上下文: 前{len(context_before)}句, 后{len(context_after)}句]"
+        speaker_info = f" [{speaker_name}]" if speaker_name else ""
+        print(f"  {retry_prefix}[{file_key}][{idx+1}/{total_in_file}]{speaker_info} 翻译: {original_text[:50]}...{context_info}")
+        
+        translated, error_msg = translate_text(original_text, api_key, terms=terms, context_before=context_before, context_after=context_after, speaker=speaker_name)
         
         with translated_count_lock:
             completed_count += 1
             
             # 更新进度记录
             with progress_lock:
-                # 确保使用新格式（索引列表）
-                if progress_data.get("version", "1.0") < "1.1":
-                    progress_data["version"] = "1.1"
-                    # 升级旧格式
-                    old_completed = progress_data.get("completed", {})
-                    new_completed = {}
-                    for fk, items in old_completed.items():
-                        if isinstance(items, dict):
-                            new_completed[fk] = [int(k) for k in items.keys() if k.isdigit()]
-                        else:
-                            new_completed[fk] = items
-                    progress_data["completed"] = new_completed
+                # 确保版本号是最新的
+                if progress_data.get("version", "1.1") < "1.2":
+                    progress_data["version"] = "1.2"
+                    # 迁移旧格式：将 idx 转换为 id（如果可能）
+                    # 这里我们保持兼容，新记录使用 id
                 
                 if file_key not in progress_data["completed"]:
                     progress_data["completed"][file_key] = []
                 if file_key not in progress_data["failed"]:
                     progress_data["failed"][file_key] = []
                 
-                idx_str = str(idx)
-                
                 if translated:
                     item["text"] = translated
                     translated_count_local += 1
-                    # 记录成功（只保存索引）
-                    if idx not in progress_data["completed"][file_key]:
-                        progress_data["completed"][file_key].append(idx)
-                    # 如果之前失败过，从失败记录中移除
+                    # 记录成功（使用 id）
+                    if item_id not in progress_data["completed"][file_key]:
+                        progress_data["completed"][file_key].append(item_id)
+                    # 如果之前失败过，从失败记录中移除（兼容旧格式）
                     if file_key in progress_data["failed"]:
-                        failed_items = progress_data["failed"][file_key]
-                        if isinstance(failed_items, list):
-                            if idx in failed_items:
-                                failed_items.remove(idx)
-                        else:
-                            # 旧格式：字典（兼容处理）
-                            if idx_str in failed_items:
-                                del failed_items[idx_str]
+                        if item_id in progress_data["failed"][file_key]:
+                            progress_data["failed"][file_key].remove(item_id)
+                        # 兼容旧格式：也检查 idx
+                        elif idx in progress_data["failed"][file_key]:
+                            progress_data["failed"][file_key].remove(idx)
                     print(f"    [{file_key}][{idx+1}] 完成: {translated[:50]}...")
                 else:
-                    # 记录失败（只保存索引）
+                    # 记录失败（使用 id）
                     failed_count_local += 1
-                    if file_key not in progress_data["failed"]:
-                        progress_data["failed"][file_key] = []
-                    # 确保是新格式（索引列表）
-                    if not isinstance(progress_data["failed"][file_key], list):
-                        # 升级旧格式
-                        old_failed = progress_data["failed"][file_key]
-                        progress_data["failed"][file_key] = [int(k) for k in old_failed.keys() if k.isdigit()]
-                    # 添加索引（如果不存在）
-                    if idx not in progress_data["failed"][file_key]:
-                        progress_data["failed"][file_key].append(idx)
+                    # 添加 id（如果不存在）
+                    if item_id not in progress_data["failed"][file_key]:
+                        progress_data["failed"][file_key].append(item_id)
                     print(f"    [{file_key}][{idx+1}] 翻译失败: {error_msg or '未知错误'}")
             
             # 更新统计信息
-            progress_data["stats"]["completed"] = sum(len(indices) if isinstance(indices, list) else (len(indices) if isinstance(indices, dict) else 0) for indices in progress_data["completed"].values())
-            progress_data["stats"]["failed"] = sum(len(indices) if isinstance(indices, list) else (len(indices) if isinstance(indices, dict) else 0) for indices in progress_data["failed"].values())
+            progress_data["stats"]["completed"] = sum(len(indices) for indices in progress_data["completed"].values())
+            progress_data["stats"]["failed"] = sum(len(indices) for indices in progress_data["failed"].values())
         
         return True
     
@@ -862,26 +1242,18 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
                     # 定期保存进度
                     with translated_count_lock:
                         if completed_count % save_interval == 0 or completed_count == len(tasks):
-                            # 保存输出文件和进度文件
-                            if "texts" in texts_data or "speakers" in texts_data:
-                                texts_data["texts"] = texts_dict
-                                texts_data["speakers"] = speakers_dict
-                                save_data = texts_data
+                            # 构建要保存的译文数据
+                            if "texts" in original_texts_data or "speakers" in original_texts_data:
+                                # 嵌套结构
+                                save_data = {
+                                    "texts": texts_dict,
+                                    "speakers": speakers_dict
+                                }
                             else:
+                                # 直接结构
                                 save_data = texts_dict
                             
-                            with file_lock:
-                                with open(output_file, 'w', encoding='utf-8') as f:
-                                    json.dump(save_data, f, ensure_ascii=False, indent=2)
-                                
-                                # 如果是直接结构且有speakers，也保存到单独的speakers_translated.json（不覆盖原文件）
-                                if speakers_dict and not ("texts" in texts_data or "speakers" in texts_data):
-                                    speakers_output_file = output_file.parent / "speakers_translated.json"
-                                    try:
-                                        with open(speakers_output_file, 'w', encoding='utf-8') as f:
-                                            json.dump(speakers_dict, f, ensure_ascii=False, indent=2)
-                                    except Exception as e:
-                                        pass  # 定期保存时静默失败，避免输出太多
+                            save_output_files(output_file, save_data, texts_dict, speakers_dict, file_lock)
                             
                             # 保存进度文件
                             with progress_lock:
@@ -918,28 +1290,18 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
         interrupted = True
         print("\n\n收到中断信号 (CTRL+C)，正在保存进度...")
     
-    # 最终保存
-    if "texts" in texts_data or "speakers" in texts_data:
-        texts_data["texts"] = texts_dict
-        texts_data["speakers"] = speakers_dict
-        save_data = texts_data
+    # 最终保存译文数据
+    if "texts" in original_texts_data or "speakers" in original_texts_data:
+        # 嵌套结构
+        save_data = {
+            "texts": texts_dict,
+            "speakers": speakers_dict
+        }
     else:
+        # 直接结构
         save_data = texts_dict
-        # 直接结构，speakers 保存到单独的 speakers_translated.json 文件（不覆盖原文件）
-        if speakers_dict:
-            speakers_output_file = output_file.parent / "speakers_translated.json"
-            try:
-                with open(speakers_output_file, 'w', encoding='utf-8') as f:
-                    json.dump(speakers_dict, f, ensure_ascii=False, indent=2)
-                print(f"Speakers 已保存到: {speakers_output_file}")
-            except Exception as e:
-                print(f"警告: 保存 speakers_translated.json 失败: {e}")
     
-    try:
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(save_data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"警告: 保存输出文件失败: {e}")
+    save_output_files(output_file, save_data, texts_dict, speakers_dict)
     
     # 最终保存进度文件
     try:
@@ -951,42 +1313,28 @@ def batch_translate_texts(texts_file: Path, api_key_file: Path, output_file: Pat
     except Exception as e:
         print(f"警告: 保存进度文件失败: {e}")
     
-    translated_count = translated_count_local
-    failed_count = failed_count_local
+    # 计算统计信息
+    speakers_completed_total = sum(1 for v in speakers_dict.values() if v and v.strip()) if speakers_dict else 0
     
-    # 计算 speakers 统计信息（直接从 speakers_dict 计算）
+    # 打印统计信息
+    status = "已中断，进度已保存" if interrupted else "完成"
+    print(f"\n翻译{status}!")
+    print(f"  本次翻译文本: {translated_count_local} 个")
+    print(f"  本次失败文本: {failed_count_local} 个")
     if speakers_dict:
-        speakers_completed_total = sum(1 for v in speakers_dict.values() if v and v.strip())
+        print(f"  本次翻译 speakers: {speakers_completed_count} 个")
+        print(f"  本次失败 speakers: {speakers_failed_count} 个")
+    print(f"  总计完成文本: {progress_data['stats']['completed']}/{total_texts if not debug else min(total_texts, debug_limit)}")
+    print(f"  总计失败文本: {progress_data['stats']['failed']} 个")
+    if speakers_dict:
+        print(f"  总计完成 speakers: {speakers_completed_total}/{len(speakers_dict)}")
+    print(f"  输出文件: {output_file}")
+    print(f"  进度文件: {progress_file}")
     
     if interrupted:
-        print(f"\n翻译已中断，进度已保存!")
-        print(f"  本次翻译文本: {translated_count} 个")
-        print(f"  本次失败文本: {failed_count} 个")
-        if speakers_dict:
-            print(f"  本次翻译 speakers: {speakers_completed_count} 个")
-            print(f"  本次失败 speakers: {speakers_failed_count} 个")
-        print(f"  总计完成文本: {progress_data['stats']['completed']}/{total_texts if not debug else min(total_texts, debug_limit)}")
-        print(f"  总计失败文本: {progress_data['stats']['failed']} 个")
-        if speakers_dict:
-            print(f"  总计完成 speakers: {speakers_completed_total}/{len(speakers_dict)}")
-        print(f"  输出文件: {output_file}")
-        print(f"  进度文件: {progress_file}")
         print(f"\n提示: 重新运行脚本将自动从上次中断的地方继续")
-    else:
-        print(f"\n翻译完成!")
-        print(f"  本次翻译文本: {translated_count} 个")
-        print(f"  本次失败文本: {failed_count} 个")
-        if speakers_dict:
-            print(f"  本次翻译 speakers: {speakers_completed_count} 个")
-            print(f"  本次失败 speakers: {speakers_failed_count} 个")
-        print(f"  总计完成文本: {progress_data['stats']['completed']}/{total_texts if not debug else min(total_texts, debug_limit)}")
-        print(f"  总计失败文本: {progress_data['stats']['failed']} 个")
-        if speakers_dict:
-            print(f"  总计完成 speakers: {speakers_completed_total}/{len(speakers_dict)}")
-        print(f"  输出文件: {output_file}")
-        print(f"  进度文件: {progress_file}")
-        if progress_data['stats']['failed'] > 0:
-            print(f"\n提示: 使用 --retry-failed 参数可以重试失败的文本")
+    elif progress_data['stats']['failed'] > 0:
+        print(f"\n提示: 使用 --retry-failed 参数可以重试失败的文本")
 
 
 def main():
@@ -999,8 +1347,9 @@ def main():
     parser.add_argument("--progress", type=Path, default=None, help="进度记录文件路径（默认: texts/translate_progress.json）")
     parser.add_argument("--dry-run", action="store_true", help="仅预览，不实际翻译")
     parser.add_argument("--debug", action="store_true", help="调试模式，仅翻译指定数量的文本")
-    parser.add_argument("--threads", type=int, default=5, help="最大并发线程数（默认: 5）")
-    parser.add_argument("--limit", type=int, default=5, help="调试模式下限制翻译的任务数（默认: 5）")
+    parser.add_argument("--threads", type=int, default=MAX_WORKERS, help=f"最大并发线程数（默认: {MAX_WORKERS}）")
+    parser.add_argument("--limit", type=int, default=2, help="调试模式下限制翻译的任务数（默认: 5）")
+    parser.add_argument("--max-tasks", type=int, default=MAX_TASKS, help=f"最大任务数限制（默认: {MAX_TASKS if MAX_TASKS else '不限制'}）")
     parser.add_argument("--no-resume", action="store_true", help="不从进度文件恢复，从头开始翻译")
     parser.add_argument("--retry-failed", action="store_true", help="仅重试之前失败的文本")
     
@@ -1019,7 +1368,8 @@ def main():
             args.limit,
             args.progress,
             resume,
-            args.retry_failed
+            args.retry_failed,
+            args.max_tasks
         )
     except KeyboardInterrupt:
         # 如果 batch_translate_texts 没有捕获到，这里作为最后的保障

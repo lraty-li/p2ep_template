@@ -18,6 +18,8 @@ DEFAULT_JSON_TRANSLATED_FILE = Path("json/all_translated.json")
 DEFAULT_OUTPUT_BASE_DIR = Path("text/event")
 DEFAULT_FILES_JSON = Path("text/event/files.json")
 DEFAULT_EXTRACTION_BASE_DIR = Path("extraction/PSP_GAME/USRDIR/pack/P2PT_ALL.cpk$/event.bin$")
+DEFAULT_TEXTS_DIR = Path("texts")
+TEXTS_TRANSLATED_FILE = "texts_translated.json"
 
 
 def load_files_config(config_path: Path) -> dict:
@@ -26,7 +28,7 @@ def load_files_config(config_path: Path) -> dict:
         return json.load(f)
 
 
-def batch_rebuild(json_file: Path, output_base_dir: Path, config_path: Path = None, extraction_base_dir: Path = None):
+def batch_rebuild(json_file: Path, output_base_dir: Path, config_path: Path = None, extraction_base_dir: Path = None, texts_dir: Path = None):
     """
     批量重组所有 JSON 文件为 .msg 文件，输出到对应的位置
     同时从日文原版复制对应的 .script 文件
@@ -36,6 +38,7 @@ def batch_rebuild(json_file: Path, output_base_dir: Path, config_path: Path = No
         output_base_dir: .msg 文件输出基础目录（如 text/event/）
         config_path: files.json 路径（用于确定输出文件名和源文件路径）
         extraction_base_dir: extraction 基础目录（用于查找原版 script 文件）
+        texts_dir: 翻译文本目录（用于加载翻译文本，可选）
     """
     output_base_dir.mkdir(parents=True, exist_ok=True)
     
@@ -59,6 +62,18 @@ def batch_rebuild(json_file: Path, output_base_dir: Path, config_path: Path = No
     with open(json_file, 'r', encoding='utf-8') as f:
         all_data = json.load(f)
     
+    # 尝试加载翻译文本（如果提供了 texts_dir）
+    translated_texts_dict = {}
+    if texts_dir:
+        texts_translated_path = texts_dir / TEXTS_TRANSLATED_FILE
+        if texts_translated_path.exists():
+            try:
+                with open(texts_translated_path, 'r', encoding='utf-8') as f:
+                    translated_texts_dict = json.load(f)
+                print(f"已加载翻译文本: {len(translated_texts_dict)} 个文件")
+            except Exception as e:
+                print(f"警告: 无法加载翻译文本: {e}")
+    
     rebuilt_count = 0
     copied_script_count = 0
     
@@ -69,8 +84,11 @@ def batch_rebuild(json_file: Path, output_base_dir: Path, config_path: Path = No
             msg_filename = file_map.get(file_key, file_key + ".msg")
             msg_path = output_base_dir / msg_filename
             
+            # 获取该文件的翻译文本（如果存在）
+            translated_texts = translated_texts_dict.get(file_key)
+            
             # 重建 .msg 文件
-            msg_content = rebuild_msg_file(json_data)
+            msg_content = rebuild_msg_file(json_data, translated_texts)
             
             with open(msg_path, 'w', encoding='utf-8') as f:
                 f.write(msg_content)
@@ -118,6 +136,7 @@ def main():
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_BASE_DIR, help="输出目录（默认: text/event）")
     parser.add_argument("--config", type=Path, default=DEFAULT_FILES_JSON, help="files.json 路径（默认: text/event/files.json）")
     parser.add_argument("--extraction", type=Path, default=DEFAULT_EXTRACTION_BASE_DIR, help="extraction 基础目录（默认: extraction/PSP_GAME/USRDIR/pack/P2PT_ALL.cpk$/event.bin$）")
+    parser.add_argument("--texts", type=Path, default=DEFAULT_TEXTS_DIR, help="翻译文本目录（默认: texts）")
     
     args = parser.parse_args()
     
@@ -138,7 +157,7 @@ def main():
     print(f"extraction_base_dir: {extraction_dir}")
     print(f"extraction_base_dir 存在: {extraction_dir.exists()}")
     
-    batch_rebuild(json_file, args.output, args.config, extraction_dir)
+    batch_rebuild(json_file, args.output, args.config, extraction_dir, args.texts)
 
 
 if __name__ == "__main__":
